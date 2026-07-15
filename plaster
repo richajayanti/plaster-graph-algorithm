@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+#
+
+#command line version
+import os
+import logging
+import subprocess
+import csv
+import sys
+import shutil
+from pathlib import Path
+from functools import partial
+from multiprocessing.pool import ThreadPool, Pool
+import tempfile
+import argparse
+from math import ceil
+from tqdm import tqdm
+from Bio import SeqIO
+from Bio.Seq import Seq
+from Bio.SeqRecord import SeqRecord
+# Adding for graph construction
+import networkx as nx
+from graph_construction import (
+    initialize_graph,
+    add_fragment_node,
+    update_genome_path,
+    export_graph
+)
+
+def get_logger(logname, loglevel=logging.INFO):
+    """
+    Setting up a logger to print messages in real time with timestamps.
+    """
+    VERBOSITY = loglevel
+    logger = logging.getLogger(logname)
+    logger.setLevel(VERBOSITY)
+    ch = logging.StreamHandler()
+    ch.setLevel(VERBOSITY)
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        "%Y-%m-%d %H:%M:%S")
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
+    return logger
+
+def run_command(command, logger):
+    """
+    Runs a shell commands like nucmer or dnadiff and logs the output or any failure
+    """
+    logger.debug(command)
+    p = subprocess.Popen(command, shell=True, stdin=None, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    fstdout, fstderr = p.communicate()
+    rc = p.returncode
+
+    fstdout = fstdout.decode("utf-8")
+    fstderr = fstderr.decode("utf-8")
+    if rc != 0:
+        logger.critical("""The following command failed:
+            >>$ {}
+
+            STDOUT:
+            {}
+
+            STDERR:
+            {}""".format(command, fstdout, fstderr))
+
+    else:
+        logger.debug(fstdout)
+        logger.debug(fstderr)
+
+def parse_input_files(input_file_txt):
+    ret = []
+    with open(input_file_txt) as input_file:
+        for line in input_file:
+            line = line.strip()
+            if len(line) > 0:
+                ret.append(line)
+
+    return ret
+
+
+def run_nucmer(filename, temp_pangenome_name, dirpath, thread, attach_len, logger, keeptmp=False):
+    temp_prefix = os.path.join(dirpath, Path(filename).stem)
+    try:
+        run_command("nucmer -t 1 --maxmatch --mincluster %s %s %s -p %s.nucmer" %(attach_len, temp_pangenome_name, filename, temp_prefix), logger)
+        deltaname = "{}.nucmer.delta".format(temp_prefix)
+        # if attach_id > 0:
+            # run_command("delta-filter -i %i %s > %s.delta-filter" %(attach_id, deltaname, deltaname), logger)
+            # deltaname = "%s.delta-filter"%deltaname
+        run_command("dnadiff -d %s -p %s" %(deltaname, deltaname), logger)
+        run_command("show-coords {} -qT > {}.coords_out".format(deltaname, deltaname), logger)
+    except subprocess.CalledProcessError as e:
+        logger.error(e)
+
+
+def plaster(filelist, thread, attach_len, attach_id, max_frag_len,
+            output_file_name, work_dir, template, align_only, logger, keeptmp=False):
+    
+    # Filter valid input files
+    pruned_files = []
+    for f in filelist:
+        if not os.path.isfile(f):
+            logger.error(f"{f} is not a valid file")
+        else:
+            pruned_files.append(f)
+    filelist = pruned_files
+
+    # Sort files by size (used as a proxy for genome length)
+    sorted_train_files = sorted(filelist, key=os.path.getsize, reverse=True)
+
+    # Initialize graph data structures
+    G, genome_paths = initialize_graph()
+
+    # Initialize the pan-genome seed
+    if not template:
+        init_file = sorted_train_files[0]
+        pangenome_seq_records = []
+        pangenome_seq_records.append(SeqRecord(Seq(""), id="frag_{-1}", description="Dummy fragment"))
+        frag_idx = 0
+    else:
+        init_file = template
+        pangenome_seq_records = list(SeqIO.parse(init_file, "fasta"))
+        frag_idx = len(pangenome_seq_records)
+
+    for record in pangenome_seq_records:
+        record.seq = record.seq.upper()
+
+    # Working directory
+    with tempfile.TemporaryDirectory() as dirpath:
+        if work_dir:
+            dirpath = work_dir
+            Path(work_dir).mkdir(parents=True, exist_ok=True)
+
+        temp_pangenome_name = os.path.join(dirpath, str(Path(output_file_name).stem) + ".fasta")
+        temp_metadata_name = os.path.join(dirpath, str(Path(output_file_name).stem) + ".tsv")
+        temp_plasmid_name = os.path.join(dirpath, str(Path(output_file_name).stem) + "_plasmid.tsv")
+
+        with open(temp_pangenome_name, 'w') as temp_pangenome_handle:
+            SeqIO.write(pangenome_seq_records, temp_pangenome_handle, "fasta")
+
+        with open(temp_metadata_name, 'w') as metadata_handle, open(temp_plasmid_name, 'w') as plasmid_handle:
+            metadata_tsv = csv.DictWriter(metadata_handle, fieldnames=["Query seq", "Query start", "Query end", "Frag seq", "Frag start", "Frag end", "%IDY"], delimiter='\t')
+            metadata_tsv.writeheader()
+            plasmid_tsv = csv.writer(plasmid_handle, delimiter='\t')
+
+            # Realign mode: parallel execution of alignment
+            if align_only:
+                with Pool(max(thread // 6, 1)) as pool:
+                    list(tqdm(pool.imap(
+                        partial(run_nucmer,
+                                temp_pangenome_name=temp_pangenome_name,
+                                dirpath=dirpath,
+                                thread=thread,
+                                attach_len=attach_len,
+                                logger=logger),
+                        sorted_train_files), total=len(sorted_train_files)))
+
+            # Map fragment sequence -> node id so that identical fragments
+            # shared across genomes collapse into a single node. This is what
+            # turns the output from parallel linear paths (a "linear
+            # concatenation") into an actual pangenome graph with branch and
+            # merge points.
+            seq_to_node = {}
+
+            for filename in tqdm(sorted_train_files):
+                logger.debug(f"Adding {filename} to pangenome")
+                if not os.path.isfile(filename):
+                    logger.error(f"{filename} is not a valid filename!")
+                    continue
+
+                genome_id = Path(filename).stem
+                # Each FASTA record is treated as one fragment.
+                for record in SeqIO.parse(filename, "fasta"):
+                    seq = str(record.seq).upper()
+
+                    existing_id = seq_to_node.get(seq)
+                    if existing_id is not None:
+                        frag_id = existing_id
+                    else:
+                        frag_id = f"frag_{frag_idx}"
+                        frag_idx += 1
+                        seq_to_node[seq] = frag_id
+
+                    # add_fragment_node records this genome on the (possibly
+                    # shared) node; update_genome_path links it into the genome's
+                    # ordered walk.
+                    add_fragment_node(G, frag_id, seq, genome_id)
+                    update_genome_path(G, genome_paths, frag_id, genome_id)
+                    logger.debug(f"Genome {genome_id}: record {record.id} -> {frag_id}")
+
+            # Export graph (GML + GraphML + GFA) at the end
+            export_graph(G, output_file_name, genome_paths)
+
+
+def main():
+    parser = argparse.ArgumentParser(prog='plaster')
+    parser.add_argument("input_files", metavar='input-files', type=str, nargs='+',
+                        help="a list of input fasta file names. If there is one file, \
+                        it is assumed that this file contains a list of input files separated by a newline")
+    parser.add_argument("-r", "--realign", action="store_true",
+                        help="Realign all input genomes to the resulting pangenome to get a more accurate fragment mapping")
+    parser.add_argument("-a", "--align-only", action="store_true",
+                        help="Used with --template. Does not append to pangenome, just produces tsv alignment.")
+    parser.add_argument("-t", "--template", default=None,
+                        help="seed genome to use")
+    parser.add_argument("-o", "--output", default="output_pan_genome",
+                        help="output pan-genome fasta and metadata file stem (does not include file extension)")
+    parser.add_argument("-w", "--work-dir", default=None,
+                        help="Directory to save nucmer outputs.")
+    parser.add_argument("-p", "--threads", default=1, type=int,
+                        help="Number of threads")
+    parser.add_argument("-l", "--length", default=50,
+                        help="Minimum length of sequence attached to the pan-genome")
+    parser.add_argument("-f", "--max-frag-len", type=int, default=100000000000, help="Maximum fragment length")
+    parser.add_argument("-i", "--id-cutoff", default=0, type=float,
+                        help="Minimum identity to record alignment in metadata")
+    parser.add_argument("-k", "--keep-tmp", action="store_true",
+                        help="Keep intermediate files")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Print verbose output")
+    parser.add_argument('--version', action='version', version='%(prog)s 1.2.1')
+    args = parser.parse_args()
+
+    if len(args.input_files) == 1 and not args.input_files[0].endswith(('.fasta', '.fa', '.fna', '.fnn', '.ffn', '.faa')):
+        input_files = parse_input_files(args.input_files[0])
+    else:
+        input_files = args.input_files
+    loglevel = logging.DEBUG if args.verbose else logging.INFO
+    logger = get_logger("Plaster", loglevel=loglevel)
+    plaster(
+        filelist=input_files, 
+        thread=args.threads,
+        attach_len=args.length, 
+        attach_id=args.id_cutoff,
+        max_frag_len=args.max_frag_len,
+        output_file_name=args.output, 
+        work_dir=args.work_dir,
+        template=args.template, 
+        align_only=args.align_only,
+        logger=logger,
+        keeptmp=args.keep_tmp)
+    if args.realign:
+        template = args.output + ".fasta"
+        logger.info("Realigning...")
+        plaster(
+            filelist=input_files, 
+            thread=args.threads,
+            attach_len=args.length, 
+            attach_id=args.id_cutoff,
+            max_frag_len=args.max_frag_len,
+            output_file_name=args.output, 
+            work_dir=args.work_dir,
+            template=template, 
+            align_only=True,
+            logger=logger,
+            keeptmp=args.keep_tmp)
+
+
+
+#run program
+main()

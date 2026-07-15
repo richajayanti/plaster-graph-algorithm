@@ -1,0 +1,13 @@
+# Virtual environment
+plaster-env/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Generated graph outputs (regenerate by running plaster).
+# The demo PNGs are NOT ignored here on purpose — they are tracked and
+# embedded in the README.
+*.gml
+*.graphml
+*.gfa
