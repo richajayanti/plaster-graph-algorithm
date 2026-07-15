@@ -1,15 +1,9 @@
-# plaster (graph edition)
+# Plaster (graph edition)
 
-A modification of **plaster** — the Treangen Lab (Rice University)'s tool for
-comparing the DNA of related organisms — that summarizes a collection of genomes
-as a **graph** (a network of connected nodes) rather than as a long list of
+A modification of **plaster** (the Treangen Lab (Rice University)'s plasmid pangenome tool) that summarizes a collection of genomes
+as a **graph** (a network of connected nodes) rather than as a list of
 sequences.
 
-In plain terms: a genome is just a long string of DNA letters, and a group of
-related organisms will share many stretches of that string while differing in
-others. The older approach lines the genomes up against one reference and reports
-which pieces are present or missing — but that flattens everything into a single
-straight line and hides *how* the genomes are rearranged relative to each other.
 This version instead builds a network where each distinct stretch of DNA is a
 node and each genome is a route through those nodes. Shared stretches become
 nodes that many routes pass through; differences show up as the routes splitting
