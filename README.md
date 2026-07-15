@@ -1,7 +1,7 @@
-# plaster (graph edition)
+# Plaster (graph edition)
 
-A modification of **plaster** — the Treangen Lab (Rice University)'s plasmid pangenome tool — that
-builds a **pangenome graph** instead of a linear concatenated pangenome. Instead
+A modification of **plaster** (the Treangen Lab (Rice University)'s plasmid pangenome tool) that
+builds a **pangenome graph** instead of a linear concatenated pangenome (a list of sequences). Instead
 of reading a flat FASTA, you can *see* which stretches of sequence are shared
 between genomes and where individual genomes diverge.
 
