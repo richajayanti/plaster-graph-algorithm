@@ -24,7 +24,9 @@ from graph_construction import (
     initialize_graph,
     add_fragment_node,
     update_genome_path,
-    export_graph
+    export_graph,
+    parse_coords_file,
+    split_query_record
 )
 
 def get_logger(logname, loglevel=logging.INFO):
@@ -93,8 +95,108 @@ def run_nucmer(filename, temp_pangenome_name, dirpath, thread, attach_len, logge
         logger.error(e)
 
 
+def build_graph_with_alignment(G, genome_paths, sorted_train_files,
+                               temp_pangenome_name, dirpath, attach_len,
+                               seq_to_node, frag_idx, logger):
+    """
+    Homology-aware graph build (requires MUMmer / nucmer).
+
+    Grows a reference "pangenome" one genome at a time. The first (largest)
+    genome seeds the reference: each of its records becomes a fragment node.
+    Every later genome is aligned to the current reference with nucmer; each of
+    its records is then cut with split_query_record into:
+      - aligned pieces  -> merged into the existing reference fragment they hit
+                           (so SNP-level differences still collapse to one node)
+      - unaligned pieces -> new genome-specific fragments, which are appended to
+                           the reference so subsequent genomes can align to them.
+
+    Reference fragments live in temp_pangenome_name as FASTA records whose ids
+    are the fragment ids, so a coords "ref tag" is directly the node id to reuse.
+
+    Returns the updated frag_idx counter.
+    """
+    if shutil.which("nucmer") is None:
+        raise RuntimeError(
+            "--align requires MUMmer (nucmer) on PATH, but it was not found. "
+            "Install MUMmer (Linux/WSL) or omit --align to use exact-match mode.")
+
+    # Reference fragments currently available to align against: id -> sequence.
+    ref_seqs = {}
+    for record in SeqIO.parse(temp_pangenome_name, "fasta"):
+        seq = str(record.seq).upper()
+        if seq:  # skip the empty dummy seed record
+            ref_seqs[record.id] = seq
+
+    def append_reference_fragment(frag_id, seq):
+        """Register a new fragment and append it to the reference FASTA so that
+        later genomes can align to it."""
+        ref_seqs[frag_id] = seq
+        with open(temp_pangenome_name, "a") as fh:
+            fh.write(">{}\n{}\n".format(frag_id, seq))
+
+    def add_fragment(frag_id, node_seq, genome_id):
+        add_fragment_node(G, frag_id, node_seq, genome_id)
+        update_genome_path(G, genome_paths, frag_id, genome_id)
+
+    for filename in tqdm(sorted_train_files):
+        if not os.path.isfile(filename):
+            logger.error(f"{filename} is not a valid filename!")
+            continue
+        genome_id = Path(filename).stem
+
+        # Seed case: nothing to align against yet -> treat each record as a
+        # fragment (deduped by exact sequence) and add it to the reference.
+        if not ref_seqs:
+            for record in SeqIO.parse(filename, "fasta"):
+                seq = str(record.seq).upper()
+                frag_id = seq_to_node.get(seq)
+                if frag_id is None:
+                    frag_id = f"frag_{frag_idx}"
+                    frag_idx += 1
+                    seq_to_node[seq] = frag_id
+                    append_reference_fragment(frag_id, seq)
+                add_fragment(frag_id, seq, genome_id)
+            continue
+
+        # Align this genome to the current reference and read back the hits.
+        run_nucmer(filename, temp_pangenome_name, dirpath, 1, attach_len, logger)
+        coords_file = os.path.join(
+            dirpath, Path(filename).stem + ".nucmer.delta.coords_out")
+        aligned = parse_coords_file(coords_file) if os.path.isfile(coords_file) else {}
+        if not aligned:
+            logger.debug(f"{genome_id}: no alignments found; all fragments treated as new")
+
+        for record in SeqIO.parse(filename, "fasta"):
+            seq = str(record.seq).upper()
+            intervals = aligned.get(record.id, [])
+            for subseq, is_aligned, ref_tag in split_query_record(seq, intervals):
+                if not subseq:
+                    continue
+                if is_aligned and ref_tag in ref_seqs:
+                    # Reuse the reference node: keep its canonical sequence,
+                    # just record that this genome also traverses it.
+                    frag_id = ref_tag
+                    node_seq = ref_seqs[ref_tag]
+                else:
+                    # Genome-specific piece: dedupe exactly, else make a new
+                    # reference fragment.
+                    frag_id = seq_to_node.get(subseq)
+                    if frag_id is None:
+                        frag_id = f"frag_{frag_idx}"
+                        frag_idx += 1
+                        seq_to_node[subseq] = frag_id
+                        append_reference_fragment(frag_id, subseq)
+                    node_seq = subseq
+                add_fragment(frag_id, node_seq, genome_id)
+                logger.debug(f"Genome {genome_id}: record {record.id} -> {frag_id} "
+                             f"({'aligned' if is_aligned else 'new'})")
+
+    return frag_idx
+
+
 def plaster(filelist, thread, attach_len, attach_id, max_frag_len,
-            output_file_name, work_dir, template, align_only, logger, keeptmp=False):
+            output_file_name, work_dir, template, align_only, logger,
+            keeptmp=False, use_alignment=False):
     
     # Filter valid input files
     pruned_files = []
@@ -162,31 +264,42 @@ def plaster(filelist, thread, attach_len, attach_id, max_frag_len,
             # merge points.
             seq_to_node = {}
 
-            for filename in tqdm(sorted_train_files):
-                logger.debug(f"Adding {filename} to pangenome")
-                if not os.path.isfile(filename):
-                    logger.error(f"{filename} is not a valid filename!")
-                    continue
+            if use_alignment:
+                # Alignment-based build (requires MUMmer / nucmer on PATH).
+                # Fragments are merged by *homology* to the growing reference
+                # instead of by exact sequence identity, so near-identical
+                # regions (SNPs, shifted boundaries) collapse into one node.
+                frag_idx = build_graph_with_alignment(
+                    G, genome_paths, sorted_train_files, temp_pangenome_name,
+                    dirpath, attach_len, seq_to_node, frag_idx, logger)
+            else:
+                # Default build: each FASTA record is one fragment, merged only
+                # when byte-for-byte identical. No external tools required.
+                for filename in tqdm(sorted_train_files):
+                    logger.debug(f"Adding {filename} to pangenome")
+                    if not os.path.isfile(filename):
+                        logger.error(f"{filename} is not a valid filename!")
+                        continue
 
-                genome_id = Path(filename).stem
-                # Each FASTA record is treated as one fragment.
-                for record in SeqIO.parse(filename, "fasta"):
-                    seq = str(record.seq).upper()
+                    genome_id = Path(filename).stem
+                    # Each FASTA record is treated as one fragment.
+                    for record in SeqIO.parse(filename, "fasta"):
+                        seq = str(record.seq).upper()
 
-                    existing_id = seq_to_node.get(seq)
-                    if existing_id is not None:
-                        frag_id = existing_id
-                    else:
-                        frag_id = f"frag_{frag_idx}"
-                        frag_idx += 1
-                        seq_to_node[seq] = frag_id
+                        existing_id = seq_to_node.get(seq)
+                        if existing_id is not None:
+                            frag_id = existing_id
+                        else:
+                            frag_id = f"frag_{frag_idx}"
+                            frag_idx += 1
+                            seq_to_node[seq] = frag_id
 
-                    # add_fragment_node records this genome on the (possibly
-                    # shared) node; update_genome_path links it into the genome's
-                    # ordered walk.
-                    add_fragment_node(G, frag_id, seq, genome_id)
-                    update_genome_path(G, genome_paths, frag_id, genome_id)
-                    logger.debug(f"Genome {genome_id}: record {record.id} -> {frag_id}")
+                        # add_fragment_node records this genome on the (possibly
+                        # shared) node; update_genome_path links it into the
+                        # genome's ordered walk.
+                        add_fragment_node(G, frag_id, seq, genome_id)
+                        update_genome_path(G, genome_paths, frag_id, genome_id)
+                        logger.debug(f"Genome {genome_id}: record {record.id} -> {frag_id}")
 
             # Export graph (GML + GraphML + GFA) at the end
             export_graph(G, output_file_name, genome_paths)
@@ -216,6 +329,9 @@ def main():
                         help="Minimum identity to record alignment in metadata")
     parser.add_argument("-k", "--keep-tmp", action="store_true",
                         help="Keep intermediate files")
+    parser.add_argument("--align", action="store_true",
+                        help="Merge fragments by homology instead of exact match. "
+                             "Requires MUMmer (nucmer) on PATH; Linux/WSL only.")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Print verbose output")
     parser.add_argument('--version', action='version', version='%(prog)s 1.2.1')
@@ -235,10 +351,11 @@ def main():
         max_frag_len=args.max_frag_len,
         output_file_name=args.output, 
         work_dir=args.work_dir,
-        template=args.template, 
+        template=args.template,
         align_only=args.align_only,
         logger=logger,
-        keeptmp=args.keep_tmp)
+        keeptmp=args.keep_tmp,
+        use_alignment=args.align)
     if args.realign:
         template = args.output + ".fasta"
         logger.info("Realigning...")

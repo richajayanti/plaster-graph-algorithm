@@ -1,9 +1,20 @@
 # plaster (graph edition)
 
-A modification of **plaster** — the Treangen Lab (Rice University)'s plasmid pangenome tool — that
-builds a **pangenome graph** instead of a linear concatenated pangenome. Instead
-of reading a flat FASTA, you can *see* which stretches of sequence are shared
-between genomes and where individual genomes diverge.
+A modification of **plaster** — the Treangen Lab (Rice University)'s tool for
+comparing the DNA of related organisms — that summarizes a collection of genomes
+as a **graph** (a network of connected nodes) rather than as a long list of
+sequences.
+
+In plain terms: a genome is just a long string of DNA letters, and a group of
+related organisms will share many stretches of that string while differing in
+others. The older approach lines the genomes up against one reference and reports
+which pieces are present or missing — but that flattens everything into a single
+straight line and hides *how* the genomes are rearranged relative to each other.
+This version instead builds a network where each distinct stretch of DNA is a
+node and each genome is a route through those nodes. Shared stretches become
+nodes that many routes pass through; differences show up as the routes splitting
+apart and rejoining. The result lets you *see*, at a glance, what the genomes
+have in common and where they diverge.
 
 ## Biological background and motivation
 
@@ -105,6 +116,10 @@ Common options (`python plaster --help` for the full list):
 - `-t, --template` &nbsp; seed genome to start the pangenome from (chosen as the
   reference backbone; by default the largest input is used, a proxy for the
   longest genome)
+- `--align` &nbsp; merge fragments by **homology** instead of exact match
+  (requires MUMmer; see [Two ways to merge fragments](#two-ways-to-merge-fragments))
+- `-l, --length` &nbsp; minimum alignment length passed to `nucmer` (only used
+  with `--align`; must be **shorter than your fragments** or nothing aligns)
 - `-p, --threads` &nbsp; number of threads
 - `-v, --verbose` &nbsp; print each `record -> fragment` assignment
 
@@ -130,25 +145,64 @@ python visualize_graph.py
   - `update_genome_path()` — append the fragment to the current genome's walk
     and add the directed edge from the previous fragment, tracking edge support.
   - `export_graph()` / `export_gfa()` — write the GML, GraphML, and GFA outputs.
-  - `parse_coords_file()` — parse `show-coords` alignment output into aligned
-    query intervals (used by the alignment-based roadmap below).
+  - `parse_coords_file()` — parse `show-coords -qT` output into aligned query
+    intervals, grouped by record (used by `--align`).
+  - `split_query_record()` — cut one query sequence into aligned/unaligned
+    fragments given those intervals (used by `--align`).
 
-## Current limitation: exact-match merging
+## Two ways to merge fragments
 
-In this build, fragments merge into one node only when their sequences are
-**exactly identical**. That works for cleanly pre-fragmented inputs, but real
-biological homology is usually *partial* — two fragments sharing a common prefix,
-or aligning at 98% identity rather than 100%. Capturing that requires a sequence
-aligner.
+The whole point of a pangenome graph is that shared sequence becomes a *single
+shared node*. plaster can decide "shared" in two ways.
 
-The original Plaster pipeline handles this with
-[MUMmer](https://github.com/mummer4/mummer): align each genome to the growing
-reference with `nucmer`/`dnadiff`, use `show-coords` to split each sequence into
-aligned and unaligned fragments, and only then build nodes. That machinery is
-present here (`run_nucmer`, `parse_coords_file`, and the `--align-only` /
-`--realign` modes) but is **not yet wired into graph construction** — MUMmer is
-Linux-only and is not invoked during the default graph build. To use it, run
-under Linux/WSL with MUMmer installed, or swap in a pure-Python aligner.
+### 1. Exact match (default — no external tools)
+
+By default, two fragments merge into one node only when their sequences are
+**byte-for-byte identical**. This needs nothing but Python and works on any
+platform (including Windows).
+
+- ✅ Correct and fast for **pre-fragmented input**, where shared regions are
+  already emitted as identical records (this is the case for the bundled
+  `genome*` and `exp_train*` examples).
+- ⚠️ On **whole-genome input** it under-connects: two related genomes that differ
+  by even one base won't merge, so the graph degenerates toward parallel linear
+  paths. A merge always means true identity, so any shared node you see is real —
+  but *absence* of sharing can't be trusted.
+
+### 2. Homology (`--align` — requires MUMmer)
+
+With `--align`, fragments merge by **alignment** instead of exact identity, so
+near-identical regions (SNPs, small indels, shifted boundaries) still collapse
+into one node. This is closer to how real pangenome graphs are built.
+
+```bash
+python plaster genomeA.fasta genomeB.fasta genomeC.fasta -o out --align -l 20
+```
+
+How it works (`build_graph_with_alignment` in `plaster`): the largest genome
+seeds a reference; each later genome is aligned to the growing reference with
+`nucmer`, and every record is cut by `split_query_record()` into aligned pieces
+(merged into the reference fragment they hit) and unaligned pieces (added as new,
+genome-specific fragments that later genomes can in turn align to).
+
+**Requirements & caveats:**
+
+- Needs [MUMmer](https://github.com/mummer4/mummer) (`nucmer`, `dnadiff`,
+  `show-coords`) on your `PATH`. MUMmer is **Linux/macOS only** — on Windows use
+  WSL. Without it, `--align` exits with a clear error and changes nothing.
+- Pass `-l` **smaller than your fragment lengths** (e.g. `-l 20` for ~45 bp
+  fragments); `nucmer`'s default cluster size will otherwise discard short hits.
+- v1 reuses a reference fragment when a query aligns to it, but does **not** yet
+  sub-split a reference fragment that's only partially covered, so fragments with
+  very different boundaries may not merge perfectly. Edge weights (alignment
+  identity) are also not recorded yet.
+
+> **Testing note:** the fragment-cutting and coords-parsing logic
+> (`split_query_record`, `parse_coords_file`) and the end-to-end merge logic in
+> `build_graph_with_alignment` are covered by unit/simulation tests that run
+> without MUMmer. The live `nucmer` invocation itself has **not** been run on
+> this (Windows) machine — validate the first real `--align` run on a Linux/WSL
+> box with MUMmer installed.
 
 
 ## Acknowledgements
